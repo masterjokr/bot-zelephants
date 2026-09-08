@@ -1,0 +1,13 @@
+{
+  "name": "bot-zelephants-parapente",
+  "version": "1.0.0",
+  "description": "Bot Discord officiel du club Parapente Z'éléphants pour covoiturages et sorties",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.17.3",
+    "dotenv": "^16.4.7"
+  }
+}
