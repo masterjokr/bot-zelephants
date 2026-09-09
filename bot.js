@@ -1,6 +1,7 @@
 // ============================================================
 // BOT DISCORD OFFICIEL - LES Z'ÉLÉPHANTS PARAPENTE
-// Commandes /covoit, !covoit, boutons [Je monte] & [Se désister]
+// Synchronisation bidirectionnelle, commandes /covoit et /sortie,
+// boutons natifs Discord [Je monte] / [Je participe] / [Se désister]
 // ============================================================
 require('dotenv').config();
 const { 
@@ -14,10 +15,11 @@ const {
   REST,
   Routes
 } = require('discord.js');
+const fs = require('fs');
+const http = require('http');
 
 if (!process.env.DISCORD_BOT_TOKEN || process.env.DISCORD_BOT_TOKEN.includes('COLLEZ_VOTRE_TOKEN')) {
   console.error("❌ ERREUR : Le token du bot n'est pas configuré dans le fichier .env !");
-  console.error("Ouvrez le fichier .env avec le Bloc-notes et collez votre token secret Discord.");
   process.exit(1);
 }
 
@@ -29,8 +31,7 @@ const client = new Client({
   ]
 });
 
-// Mémoire locale pour synchronisation en direct avec le site web
-const fs = require('fs');
+// Cache local persistent pour synchronisation avec le site web
 let storedRides = [];
 let storedOutings = [];
 
@@ -51,7 +52,122 @@ function saveCache() {
   } catch (e) {}
 }
 
-// Enregistrement des commandes /covoit et /sortie avec lieu de RDV obligatoire
+// Recherche intelligente du meilleur salon textuel Discord
+function findTargetChannel(type, preferredChannelId) {
+  if (preferredChannelId) {
+    const ch = client.channels.cache.get(preferredChannelId);
+    if (ch && ch.isTextBased()) return ch;
+  }
+  const keywords = type === 'covoit' 
+    ? ['covoit', 'navette', 'voiture', 'trajet', 'transport'] 
+    : ['sortie', 'calendrier', 'vol', 'activite', 'programme'];
+  
+  for (const [_, guild] of client.guilds.cache) {
+    for (const [_, channel] of guild.channels.cache) {
+      if (channel.isTextBased()) {
+        const n = channel.name.toLowerCase();
+        if (keywords.some(k => n.includes(k))) return channel;
+      }
+    }
+  }
+  for (const [_, guild] of client.guilds.cache) {
+    for (const [_, channel] of guild.channels.cache) {
+      if (channel.isTextBased() && (channel.name.includes('general') || channel.name.includes('discussion') || channel.name.includes('accueil'))) {
+        return channel;
+      }
+    }
+  }
+  for (const [_, guild] of client.guilds.cache) {
+    for (const [_, channel] of guild.channels.cache) {
+      if (channel.isTextBased()) return channel;
+    }
+  }
+  return null;
+}
+
+// Construction Embed Covoiturage avec boutons natifs Discord
+function buildRideEmbed(driverName, destination, time, rdv, totalSeats, passengers, comment, rideId) {
+  const safeSeats = totalSeats || 4;
+  const safePassengers = Array.isArray(passengers) ? passengers : [];
+  const remaining = safeSeats - safePassengers.length;
+  const isFull = remaining <= 0;
+  const bar = '🟩'.repeat(Math.min(safePassengers.length, safeSeats)) + '⬜'.repeat(Math.max(0, remaining));
+  const safeId = rideId || '';
+  
+  const embed = new EmbedBuilder()
+    .setColor(isFull ? 0xEF4444 : 0x0EA5E9)
+    .setTitle(`🚗 Navette ${destination || 'Site de vol'} • Départ ${time || 'À convenir'}`)
+    .setDescription(`Chauffeur : **${driverName || 'Pilote Zéléph'}**\n📍 Rendez-vous départ : **${rdv || 'Atterrissage habituel'}**${comment ? `\n💬 *« ${comment} »*` : ''}`)
+    .addFields(
+      { 
+        name: `Places : ${safePassengers.length}/${safeSeats} (${isFull ? '🔴 COMPLET' : `${remaining} libre(s)`})`, 
+        value: bar || '⬜' 
+      },
+      { 
+        name: '👥 Passagers inscrits', 
+        value: safePassengers.length > 0 ? safePassengers.map((p, i) => `${i + 1}. ${p}`).join('\n') : '*Aucun passager pour l\'instant — Cliquez sur [Je monte] !*' 
+      }
+    )
+    .setFooter({ text: "Club Les Z'éléphants • Cliquez ci-dessous pour réserver ou vous désister" })
+    .setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(safeId ? `ride_join:${safeId}` : 'ride_join')
+      .setLabel(isFull ? 'Navette Complète' : '🚗 Je monte (+1 place)')
+      .setStyle(isFull ? ButtonStyle.Secondary : ButtonStyle.Success)
+      .setDisabled(isFull),
+    new ButtonBuilder()
+      .setCustomId(safeId ? `ride_leave:${safeId}` : 'ride_leave')
+      .setLabel('❌ Se désister')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+// Construction Embed Sortie Club avec boutons natifs Discord
+function buildOutingEmbed(organizerName, title, dateHeure, rdv, site, maxPilotes, niveau, description, participants, outingId) {
+  const safeMax = maxPilotes || 8;
+  const safeParticipants = Array.isArray(participants) ? participants.map(p => typeof p === 'string' ? p : (p.name || 'Pilote')) : [];
+  const remaining = safeMax - safeParticipants.length;
+  const isFull = remaining <= 0;
+  const bar = '🟦'.repeat(Math.min(safeParticipants.length, safeMax)) + '⬜'.repeat(Math.max(0, remaining));
+  const safeId = outingId || '';
+
+  const embed = new EmbedBuilder()
+    .setColor(isFull ? 0x8B5CF6 : 0x10B981)
+    .setTitle(`📅 Sortie Club : ${title || 'Sortie Parapente'}`)
+    .setDescription(`Organisateur : **${organizerName || 'Organisateur Zéléph'}**\n⏰ Date & Heure : **${dateHeure || 'À convenir'}**\n📍 RDV de départ : **${rdv || 'Atterrissage'}**\n🪂 Site / Massif : **${site || 'Massif'}**\n🎓 Niveau : **${niveau || 'Tous pilotes'}**${description ? `\n\n📝 *« ${description} »*` : ''}`)
+    .addFields(
+      { 
+        name: `Pilotes : ${safeParticipants.length}/${safeMax} (${isFull ? '🔴 GROUPE COMPLET' : `${remaining} place(s) restante(s)`})`, 
+        value: bar || '⬜' 
+      },
+      { 
+        name: '👥 Pilotes participants', 
+        value: safeParticipants.length > 0 ? safeParticipants.map((p, i) => `${i + 1}. ${p}`).join('\n') : '*Aucun inscrit pour le moment — Cliquez sur [Je participe] !*' 
+      }
+    )
+    .setFooter({ text: "Club Parapente Les Z'éléphants • Cliquez ci-dessous pour rejoindre ou vous désister" })
+    .setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(safeId ? `outing_join:${safeId}` : 'outing_join')
+      .setLabel(isFull ? 'Groupe Complet' : '🪂 Je participe !')
+      .setStyle(isFull ? ButtonStyle.Secondary : ButtonStyle.Success)
+      .setDisabled(isFull),
+    new ButtonBuilder()
+      .setCustomId(safeId ? `outing_leave:${safeId}` : 'outing_leave')
+      .setLabel('❌ Se désister')
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+// Commandes Slash /covoit et /sortie
 const commands = [
   new SlashCommandBuilder()
     .setName('covoit')
@@ -78,112 +194,27 @@ client.once('ready', async () => {
   
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_BOT_TOKEN);
   try {
-    console.log('🔄 Enregistrement des commandes slash /covoit et /sortie...');
-    
-    // 1. Enregistrement INSTANTANÉ sur chaque serveur où le Bot est présent
     for (const [guildId, guild] of client.guilds.cache) {
       try {
         await rest.put(
           Routes.applicationGuildCommands(client.user.id, guildId),
           { body: commands }
         );
-        console.log(`🚀 Commandes /covoit et /sortie activées INSTANTANÉMENT sur le serveur : "${guild.name}" !`);
+        console.log(`🚀 Commandes enregistrées sur : "${guild.name}"`);
       } catch (gErr) {
-        console.warn(`Avertissement pour le serveur ${guild.name} :`, gErr.message);
+        console.warn(`Avertissement ${guild.name}:`, gErr.message);
       }
     }
-
-    // 2. Enregistrement global
-    await rest.put(
-      Routes.applicationCommands(client.user.id),
-      { body: commands }
-    );
-    console.log('✅ Commandes globales enregistrées auprès de Discord.');
+    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
   } catch (error) {
     console.error('Erreur enregistrement commandes:', error);
   }
 });
 
-// Helper pour fabriquer le message Discord Covoiturage
-function buildRideEmbed(driverName, destination, time, rdv, totalSeats, passengers, comment) {
-  const remaining = totalSeats - passengers.length;
-  const isFull = remaining <= 0;
-  const bar = '🟩'.repeat(passengers.length) + '⬜'.repeat(Math.max(0, remaining));
-  
-  const embed = new EmbedBuilder()
-    .setColor(isFull ? 0xEF4444 : 0x0EA5E9)
-    .setTitle(`🚗 Navette ${destination} • Départ ${time}`)
-    .setDescription(`Chauffeur : **${driverName}**\n📍 Rendez-vous départ : **${rdv || 'Atterrissage habituel'}**${comment ? `\n💬 *« ${comment} »*` : ''}`)
-    .addFields(
-      { 
-        name: `Places : ${passengers.length}/${totalSeats} (${isFull ? '🔴 COMPLET' : `${remaining} libre(s)`})`, 
-        value: bar 
-      },
-      { 
-        name: '👥 Passagers inscrits', 
-        value: passengers.length > 0 ? passengers.map((p, i) => `${i + 1}. ${p}`).join('\n') : '*Aucun passager pour l\'instant — Cliquez sur [Je monte] !*' 
-      }
-    )
-    .setFooter({ text: "Club Les Z'éléphants • Cliquez ci-dessous pour réserver votre place" })
-    .setTimestamp();
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('ride_join')
-      .setLabel(isFull ? 'Navette Complète' : '🚗 Je monte (+1 place)')
-      .setStyle(isFull ? ButtonStyle.Secondary : ButtonStyle.Success)
-      .setDisabled(isFull),
-    new ButtonBuilder()
-      .setCustomId('ride_leave')
-      .setLabel('❌ Se désister')
-      .setStyle(ButtonStyle.Danger)
-  );
-
-  return { embeds: [embed], components: [row] };
-}
-
-// Helper pour fabriquer le message Discord Sortie Club
-function buildOutingEmbed(organizerName, title, dateHeure, rdv, site, maxPilotes, niveau, description, participants) {
-  const remaining = maxPilotes - participants.length;
-  const isFull = remaining <= 0;
-  const bar = '🟦'.repeat(participants.length) + '⬜'.repeat(Math.max(0, remaining));
-
-  const embed = new EmbedBuilder()
-    .setColor(isFull ? 0x8B5CF6 : 0x10B981)
-    .setTitle(`📅 Sortie Club : ${title}`)
-    .setDescription(`Organisateur : **${organizerName}**\n⏰ Date & Heure : **${dateHeure}**\n📍 RDV de départ : **${rdv}**\n🪂 Site / Massif : **${site}**\n🎓 Niveau : **${niveau || 'Tous pilotes'}**${description ? `\n\n📝 *« ${description} »*` : ''}`)
-    .addFields(
-      { 
-        name: `Pilotes : ${participants.length}/${maxPilotes} (${isFull ? '🔴 GROUPE COMPLET' : `${remaining} place(s) restante(s)`})`, 
-        value: bar 
-      },
-      { 
-        name: '👥 Pilotes participants', 
-        value: participants.length > 0 ? participants.map((p, i) => `${i + 1}. ${p}`).join('\n') : '*Aucun inscrit pour le moment — Cliquez sur [Je participe] !*' 
-      }
-    )
-    .setFooter({ text: "Club Parapente Les Z'éléphants • Cliquez ci-dessous pour rejoindre" })
-    .setTimestamp();
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('outing_join')
-      .setLabel(isFull ? 'Groupe Complet' : '🪂 Je participe !')
-      .setStyle(isFull ? ButtonStyle.Secondary : ButtonStyle.Success)
-      .setDisabled(isFull),
-    new ButtonBuilder()
-      .setCustomId('outing_leave')
-      .setLabel('❌ Se désister')
-      .setStyle(ButtonStyle.Danger)
-  );
-
-  return { embeds: [embed], components: [row] };
-}
-
-// 1. Gestion des Slash commands (/covoit et /sortie)
+// Interactions (Slash commands & Boutons)
 client.on('interactionCreate', async interaction => {
+  // 1. Slash commands
   if (interaction.isChatInputCommand()) {
-    // --- /covoit ---
     if (interaction.commandName === 'covoit') {
       const dest = interaction.options.getString('destination');
       const rdv = interaction.options.getString('rdv');
@@ -192,12 +223,14 @@ client.on('interactionCreate', async interaction => {
       const comment = interaction.options.getString('commentaire') || '';
 
       const driver = interaction.user.displayName || interaction.user.username;
-      const payload = buildRideEmbed(driver, dest, time, rdv, places, [], comment);
+      const rideId = 'discord-ride-' + Date.now();
+      const payload = buildRideEmbed(driver, dest, time, rdv, places, [], comment, rideId);
+      
       await interaction.reply(payload);
+      const replyMsg = await interaction.fetchReply();
 
-      // Enregistrer pour synchronisation site web
       storedRides.unshift({
-        id: 'discord-ride-' + Date.now(),
+        id: rideId,
         driverName: driver,
         departurePlace: rdv,
         destinationSiteName: dest,
@@ -209,13 +242,13 @@ client.on('interactionCreate', async interaction => {
         passengers: [],
         comment: comment || 'Proposé sur Discord',
         createdAt: new Date().toISOString(),
-        discordMessageId: interaction.id
+        discordMessageId: replyMsg.id,
+        discordChannelId: interaction.channelId
       });
       saveCache();
       return;
     }
 
-    // --- /sortie ---
     if (interaction.commandName === 'sortie') {
       const titre = interaction.options.getString('titre');
       const dateHeure = interaction.options.getString('date_heure');
@@ -226,13 +259,15 @@ client.on('interactionCreate', async interaction => {
       const desc = interaction.options.getString('description') || '';
 
       const organizer = interaction.user.displayName || interaction.user.username;
-      const payload = buildOutingEmbed(organizer, titre, dateHeure, rdv, site, max, niveau, desc, []);
+      const outingId = 'discord-outing-' + Date.now();
+      const payload = buildOutingEmbed(organizer, titre, dateHeure, rdv, site, max, niveau, desc, [], outingId);
+      
       await interaction.reply(payload);
+      const replyMsg = await interaction.fetchReply();
 
-      // Enregistrer pour synchronisation site web
       const now = new Date();
       storedOutings.unshift({
-        id: 'discord-outing-' + Date.now(),
+        id: outingId,
         title: titre,
         type: 'cross_debutant',
         typeLabel: niveau,
@@ -254,40 +289,55 @@ client.on('interactionCreate', async interaction => {
         status: 'confirmed',
         description: desc || `RDV : ${rdv} • ${dateHeure}`,
         createdAt: new Date().toISOString(),
-        discordMessageId: interaction.id
+        discordMessageId: replyMsg.id,
+        discordChannelId: interaction.channelId
       });
       saveCache();
       return;
     }
   }
 
-  // 2. Clic sur les boutons natifs Discord
+  // 2. Clics sur boutons Discord
   if (interaction.isButton()) {
     const message = interaction.message;
     const oldEmbed = message.embeds[0];
     if (!oldEmbed) return;
-    const userName = interaction.user.displayName || interaction.user.username;
+    const userName = interaction.member?.displayName || interaction.user.displayName || interaction.user.username;
+    const customId = interaction.customId;
 
-    // --- Boutons Navette Covoiturage ---
-    if (interaction.customId === 'ride_join' || interaction.customId === 'ride_leave') {
-      const titleMatch = oldEmbed.title ? oldEmbed.title.match(/Navette (.*) • Départ (.*)/) : null;
-      const destination = titleMatch ? titleMatch[1] : 'Vol';
-      const time = titleMatch ? titleMatch[2] : 'Aujourd\'hui';
+    // --- Navettes ---
+    if (customId === 'ride_join' || customId.startsWith('ride_join:') || customId === 'ride_leave' || customId.startsWith('ride_leave:')) {
+      const isJoin = customId.startsWith('ride_join');
+      const rideId = customId.includes(':') ? customId.split(':')[1] : null;
+
+      let targetRide = storedRides.find(r => (rideId && r.id === rideId) || r.discordMessageId === message.id);
       
-      const passengersField = oldEmbed.fields.find(f => f.name.includes('Passagers'));
-      let passengers = [];
-      if (passengersField && !passengersField.value.includes('*Aucun')) {
-        passengers = passengersField.value.split('\n').map(l => l.replace(/^\d+\.\s*/, '').trim());
+      let driverName = targetRide?.driverName;
+      let destination = targetRide?.destinationSiteName;
+      let time = targetRide?.departureTime;
+      let rdv = targetRide?.departurePlace || 'Atterrissage';
+      let totalSeats = targetRide?.totalSeats || 4;
+      let passengers = targetRide?.passengers ? [...targetRide.passengers] : [];
+      let comment = targetRide?.comment || '';
+
+      if (!targetRide) {
+        const titleMatch = oldEmbed.title ? oldEmbed.title.match(/Navette (.*) • Départ (.*)/) : null;
+        if (titleMatch) {
+          destination = titleMatch[1];
+          time = titleMatch[2];
+        }
+        const passengersField = oldEmbed.fields.find(f => f.name.includes('Passagers'));
+        if (passengersField && !passengersField.value.includes('*Aucun')) {
+          passengers = passengersField.value.split('\n').map(l => l.replace(/^\d+\.\s*/, '').trim());
+        }
+        const placesField = oldEmbed.fields.find(f => f.name.includes('Places'));
+        if (placesField) {
+          const match = placesField.name.match(/\/(\d+)/);
+          if (match) totalSeats = parseInt(match[1], 10);
+        }
       }
 
-      const placesField = oldEmbed.fields.find(f => f.name.includes('Places'));
-      let totalSeats = 4;
-      if (placesField) {
-        const match = placesField.name.match(/\/(\d+)/);
-        if (match) totalSeats = parseInt(match[1], 10);
-      }
-
-      if (interaction.customId === 'ride_join') {
+      if (isJoin) {
         if (passengers.includes(userName)) {
           return interaction.reply({ content: '⚠️ Tu es déjà inscrit dans cette navette !', ephemeral: true });
         }
@@ -302,37 +352,67 @@ client.on('interactionCreate', async interaction => {
         passengers = passengers.filter(p => p !== userName);
       }
 
-      const updated = buildRideEmbed('Le Chauffeur', destination, time, 'Voir description', totalSeats, passengers, '');
+      const effectiveRideId = rideId || targetRide?.id || ('discord-ride-' + Date.now());
+      const updated = buildRideEmbed(driverName || 'Le Chauffeur', destination || 'Vol', time || 'Aujourd\'hui', rdv, totalSeats, passengers, comment, effectiveRideId);
       await interaction.update(updated);
 
-      // Mettre à jour le cache du site
-      const targetRide = storedRides.find(r => r.destinationSiteName === destination && r.departureTime === time);
       if (targetRide) {
         targetRide.passengers = passengers;
         targetRide.availableSeats = Math.max(0, totalSeats - passengers.length);
-        saveCache();
+        targetRide.discordMessageId = message.id;
+        targetRide.discordChannelId = message.channelId;
+      } else {
+        storedRides.unshift({
+          id: effectiveRideId,
+          driverName: driverName || 'Le Chauffeur',
+          departurePlace: rdv,
+          destinationSiteName: destination || 'Vol',
+          destinationSiteId: (destination || 'vol').toLowerCase().replace(/[^a-z0-9]/g, '-'),
+          departureTime: time || 'Aujourd\'hui',
+          availableSeats: Math.max(0, totalSeats - passengers.length),
+          totalSeats,
+          wingTypes: 'Solo / Tandem bienvenus',
+          passengers,
+          comment,
+          createdAt: new Date().toISOString(),
+          discordMessageId: message.id,
+          discordChannelId: message.channelId
+        });
       }
+      saveCache();
       return;
     }
 
-    // --- Boutons Sortie Club ---
-    if (interaction.customId === 'outing_join' || interaction.customId === 'outing_leave') {
-      const title = oldEmbed.title ? oldEmbed.title.replace('📅 Sortie Club : ', '') : 'Sortie';
-      
-      const pilotsField = oldEmbed.fields.find(f => f.name.includes('Pilotes participants'));
-      let participants = [];
-      if (pilotsField && !pilotsField.value.includes('*Aucun')) {
-        participants = pilotsField.value.split('\n').map(l => l.replace(/^\d+\.\s*/, '').trim());
+    // --- Sorties Club ---
+    if (customId === 'outing_join' || customId.startsWith('outing_join:') || customId === 'outing_leave' || customId.startsWith('outing_leave:')) {
+      const isJoin = customId.startsWith('outing_join');
+      const outingId = customId.includes(':') ? customId.split(':')[1] : null;
+
+      let targetOuting = storedOutings.find(o => (outingId && o.id === outingId) || o.discordMessageId === message.id);
+
+      let organizerName = targetOuting?.organizerName;
+      let title = targetOuting?.title || (oldEmbed.title ? oldEmbed.title.replace('📅 Sortie Club : ', '') : 'Sortie Club');
+      let dateHeure = targetOuting ? `${targetOuting.date} à ${targetOuting.time}` : 'Voir description';
+      let rdv = targetOuting?.meetingPoint || 'Voir description';
+      let site = targetOuting?.siteName || 'Massif';
+      let maxPilotes = targetOuting?.maxParticipants || 8;
+      let niveau = targetOuting?.conditionsRequired?.minPilotLevel || targetOuting?.typeLabel || 'Tous niveaux';
+      let description = targetOuting?.description || '';
+      let participants = targetOuting?.participants ? targetOuting.participants.map(p => typeof p === 'string' ? p : p.name) : [];
+
+      if (!targetOuting) {
+        const pilotsField = oldEmbed.fields.find(f => f.name.includes('Pilotes participants'));
+        if (pilotsField && !pilotsField.value.includes('*Aucun')) {
+          participants = pilotsField.value.split('\n').map(l => l.replace(/^\d+\.\s*/, '').trim());
+        }
+        const placesField = oldEmbed.fields.find(f => f.name.includes('Pilotes :'));
+        if (placesField) {
+          const match = placesField.name.match(/\/(\d+)/);
+          if (match) maxPilotes = parseInt(match[1], 10);
+        }
       }
 
-      const placesField = oldEmbed.fields.find(f => f.name.includes('Pilotes :'));
-      let maxPilotes = 8;
-      if (placesField) {
-        const match = placesField.name.match(/\/(\d+)/);
-        if (match) maxPilotes = parseInt(match[1], 10);
-      }
-
-      if (interaction.customId === 'outing_join') {
+      if (isJoin) {
         if (participants.includes(userName)) {
           return interaction.reply({ content: '⚠️ Tu es déjà inscrit à cette sortie !', ephemeral: true });
         }
@@ -347,26 +427,56 @@ client.on('interactionCreate', async interaction => {
         participants = participants.filter(p => p !== userName);
       }
 
-      const updated = buildOutingEmbed('L\'organisateur', title, 'Voir description', 'Voir description', 'Massif', maxPilotes, 'Tous niveaux', '', participants);
+      const effectiveOutingId = outingId || targetOuting?.id || ('discord-outing-' + Date.now());
+      const updated = buildOutingEmbed(organizerName || 'L\'organisateur', title, dateHeure, rdv, site, maxPilotes, niveau, description, participants, effectiveOutingId);
       await interaction.update(updated);
 
-      // Mettre à jour le cache du site
-      const targetOuting = storedOutings.find(o => o.title === title);
       if (targetOuting) {
         targetOuting.participants = participants.map(p => ({
-          id: 'p-' + p,
+          id: 'p-' + p.toLowerCase().replace(/[^a-z0-9]/g, '-'),
           name: p,
           status: 'confirmed',
           joinedAt: new Date().toISOString()
         }));
-        saveCache();
+        targetOuting.discordMessageId = message.id;
+        targetOuting.discordChannelId = message.channelId;
+      } else {
+        storedOutings.unshift({
+          id: effectiveOutingId,
+          title,
+          type: 'cross_debutant',
+          typeLabel: niveau,
+          date: new Date().toISOString().split('T')[0],
+          time: '10:00',
+          siteName: site,
+          meetingPoint: rdv,
+          organizerId: 'bot',
+          organizerName: organizerName || 'L\'organisateur',
+          organizerAvatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
+          organizerPhone: '',
+          organizerRole: 'Membre Discord',
+          conditionsRequired: { minPilotLevel: niveau, gearRequired: ['Radio 146.500'] },
+          maxParticipants: maxPilotes,
+          participants: participants.map(p => ({
+            id: 'p-' + p.toLowerCase().replace(/[^a-z0-9]/g, '-'),
+            name: p,
+            status: 'confirmed',
+            joinedAt: new Date().toISOString()
+          })),
+          status: 'confirmed',
+          description,
+          createdAt: new Date().toISOString(),
+          discordMessageId: message.id,
+          discordChannelId: message.channelId
+        });
       }
+      saveCache();
       return;
     }
   }
 });
 
-// 3. Raccourci texte pour les anciens : !covoit <site> <rdv> <heure> <places>
+// Raccourci texte !covoit <site> <rdv> <heure> <places>
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
   const content = message.content.trim();
@@ -377,12 +487,13 @@ client.on('messageCreate', async message => {
     const rdv = parts[1] || 'Atterro';
     const time = parts[2] || '14h00';
     const places = parseInt(parts[3], 10) || 3;
+    const rideId = 'discord-ride-' + Date.now();
 
-    const payload = buildRideEmbed(message.author.displayName || message.author.username, dest, time, rdv, places, [], 'Créé via !covoit');
-    await message.channel.send(payload);
+    const payload = buildRideEmbed(message.author.displayName || message.author.username, dest, time, rdv, places, [], 'Créé via !covoit', rideId);
+    const sent = await message.channel.send(payload);
 
     storedRides.unshift({
-      id: 'discord-ride-' + Date.now(),
+      id: rideId,
       driverName: message.author.displayName || message.author.username,
       departurePlace: rdv,
       destinationSiteName: dest,
@@ -393,17 +504,33 @@ client.on('messageCreate', async message => {
       wingTypes: 'Solo / Tandem bienvenus',
       passengers: [],
       comment: 'Créé via !covoit',
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      discordMessageId: sent.id,
+      discordChannelId: message.channel.id
     });
     saveCache();
   }
 });
 
-// Serveur HTTP REST avec CORS pour synchronisation en direct avec le site web
-const http = require('http');
+// Helper parsing JSON
+function parseJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (err) {
+        resolve({});
+      }
+    });
+    req.on('error', err => reject(err));
+  });
+}
+
+// Serveur HTTP REST avec CORS (Render & Railway)
 const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  // En-têtes CORS universels pour autoriser la consultation depuis le site web
+http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -414,8 +541,8 @@ http.createServer((req, res) => {
     return;
   }
 
-  // Endpoint de synchronisation bi-directionnelle
-  if (req.url === '/api/sync' || req.url === '/api/rides') {
+  // 1. Endpoint GET de synchronisation PWA
+  if (req.method === 'GET' && (req.url === '/api/sync' || req.url === '/api/rides')) {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({
       status: 'ok',
@@ -426,9 +553,187 @@ http.createServer((req, res) => {
     return;
   }
 
+  // 2. Endpoint POST pour publier / mettre à jour un Covoiturage depuis la PWA
+  if (req.method === 'POST' && (req.url === '/api/post-covoit' || req.url === '/api/sync-ride')) {
+    try {
+      const data = await parseJsonBody(req);
+      const ride = data.ride || data;
+      if (!ride) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: 'Données navette manquantes' }));
+      }
+
+      const driverName = ride.driverName || 'Pilote Zéléph';
+      const dest = ride.destinationSiteName || 'Site de vol';
+      const time = ride.departureTime || 'À convenir';
+      const rdv = ride.departurePlace || 'Atterrissage';
+      const totalSeats = ride.totalSeats || 4;
+      const passengers = Array.isArray(ride.passengers) ? ride.passengers : [];
+      const comment = ride.comment || '';
+      const rideId = ride.id;
+
+      const payload = buildRideEmbed(driverName, dest, time, rdv, totalSeats, passengers, comment, rideId);
+
+      let channel = null;
+      let msg = null;
+
+      // Édition en direct sans doublon si déjà sur Discord
+      if (ride.discordChannelId && ride.discordMessageId) {
+        try {
+          channel = await client.channels.fetch(ride.discordChannelId);
+          if (channel && channel.isTextBased()) {
+            msg = await channel.messages.fetch(ride.discordMessageId);
+            if (msg) {
+              await msg.edit(payload);
+            }
+          }
+        } catch (editErr) {
+          console.log('Message Discord existant non trouvable pour édition :', editErr.message);
+        }
+      }
+
+      // Si pas encore sur Discord ou introuvable, poster dans le bon salon
+      if (!msg) {
+        channel = findTargetChannel('covoit', ride.discordChannelId);
+        if (!channel) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: false, error: 'Aucun salon accessible pour poster la navette' }));
+        }
+        msg = await channel.send(payload);
+      }
+
+      const existingIdx = storedRides.findIndex(r => r.id === rideId || (msg && r.discordMessageId === msg.id));
+      const record = {
+        ...ride,
+        discordMessageId: msg.id,
+        discordChannelId: channel.id,
+        updatedAt: new Date().toISOString()
+      };
+      if (existingIdx >= 0) {
+        storedRides[existingIdx] = record;
+      } else {
+        storedRides.unshift(record);
+      }
+      saveCache();
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        messageId: msg.id,
+        channelId: channel.id,
+        isPatched: Boolean(ride.discordMessageId && msg.id === ride.discordMessageId)
+      }));
+    } catch (err) {
+      console.error('Erreur /api/post-covoit:', err);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: err.message }));
+    }
+    return;
+  }
+
+  // 3. Endpoint POST pour publier / mettre à jour une Sortie Club depuis la PWA
+  if (req.method === 'POST' && (req.url === '/api/post-sortie' || req.url === '/api/sync-outing')) {
+    try {
+      const data = await parseJsonBody(req);
+      const outing = data.outing || data;
+      if (!outing) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: 'Données sortie manquantes' }));
+      }
+
+      const organizerName = outing.organizerName || 'Organisateur Zéléph';
+      const title = outing.title || 'Sortie Club';
+      const dateHeure = `${outing.date || ''} à ${outing.time || ''}`;
+      const rdv = outing.meetingPoint || 'Atterrissage';
+      const site = outing.siteName || 'Massif';
+      const maxPilotes = outing.maxParticipants || 8;
+      const niveau = outing.conditionsRequired?.minPilotLevel || outing.typeLabel || 'Tous niveaux';
+      const description = outing.description || '';
+      const participants = Array.isArray(outing.participants) ? outing.participants.map(p => typeof p === 'string' ? p : p.name) : [];
+      const outingId = outing.id;
+
+      const payload = buildOutingEmbed(organizerName, title, dateHeure, rdv, site, maxPilotes, niveau, description, participants, outingId);
+
+      let channel = null;
+      let msg = null;
+
+      // Édition en direct sans doublon si déjà sur Discord
+      if (outing.discordChannelId && outing.discordMessageId) {
+        try {
+          channel = await client.channels.fetch(outing.discordChannelId);
+          if (channel && channel.isTextBased()) {
+            msg = await channel.messages.fetch(outing.discordMessageId);
+            if (msg) {
+              await msg.edit(payload);
+            }
+          }
+        } catch (editErr) {
+          console.log('Message Discord existant non trouvable pour édition :', editErr.message);
+        }
+      }
+
+      // Si pas encore sur Discord ou introuvable, poster dans le bon salon
+      if (!msg) {
+        channel = findTargetChannel('sortie', outing.discordChannelId);
+        if (!channel) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ ok: false, error: 'Aucun salon accessible pour poster la sortie' }));
+        }
+        msg = await channel.send(payload);
+      }
+
+      const existingIdx = storedOutings.findIndex(o => o.id === outingId || (msg && o.discordMessageId === msg.id));
+      const record = {
+        ...outing,
+        discordMessageId: msg.id,
+        discordChannelId: channel.id,
+        updatedAt: new Date().toISOString()
+      };
+      if (existingIdx >= 0) {
+        storedOutings[existingIdx] = record;
+      } else {
+        storedOutings.unshift(record);
+      }
+      saveCache();
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        messageId: msg.id,
+        channelId: channel.id,
+        isPatched: Boolean(outing.discordMessageId && msg.id === outing.discordMessageId)
+      }));
+    } catch (err) {
+      console.error('Erreur /api/post-sortie:', err);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: err.message }));
+    }
+    return;
+  }
+
   // Page d'accueil / test de santé
-  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end("Bot Discord Z'éléphants Parapente en ligne 24h/24 ! API de synchronisation active.");
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(`<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Bot Discord Z'éléphants</title>
+    <style>
+      body { font-family: system-ui, sans-serif; background: #0f172a; color: white; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+      .card { background: #1e293b; padding: 2rem; border-radius: 1rem; border: 1px solid rgba(255,255,255,0.1); max-width: 500px; text-align: center; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5); }
+      .badge { display: inline-block; background: #10b981; color: #022c22; font-weight: bold; padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.875rem; margin-bottom: 1rem; }
+      h1 { margin: 0 0 0.5rem 0; font-size: 1.5rem; }
+      p { color: #94a3b8; font-size: 0.95rem; line-height: 1.5; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="badge">● EN LIGNE 24H/24</div>
+      <h1>🐘 Bot Discord Z'éléphants Volants</h1>
+      <p>Passerelle active avec boutons natifs Discord et synchronisation temps réel avec l'application PWA.</p>
+    </div>
+  </body>
+</html>`);
 }).listen(PORT, () => {
   console.log(`🌐 Serveur Web actif sur le port ${PORT} (compatible Render & Railway)`);
 });
