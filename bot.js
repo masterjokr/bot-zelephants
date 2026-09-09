@@ -53,33 +53,53 @@ function saveCache() {
 }
 
 // Recherche intelligente du meilleur salon textuel Discord
-function findTargetChannel(type, preferredChannelId) {
+async function findTargetChannel(type, preferredChannelId) {
   if (preferredChannelId) {
-    const ch = client.channels.cache.get(preferredChannelId);
-    if (ch && ch.isTextBased()) return ch;
+    try {
+      const ch = await client.channels.fetch(preferredChannelId).catch(() => null);
+      if (ch && ch.isTextBased()) return ch;
+    } catch (e) {}
   }
   const keywords = type === 'covoit' 
-    ? ['covoit', 'navette', 'voiture', 'trajet', 'transport'] 
-    : ['sortie', 'calendrier', 'vol', 'activite', 'programme'];
+    ? ['covoit', 'covoiturage', 'navette', 'voiture', 'trajet', 'transport', 'auto', 'ride'] 
+    : ['sortie', 'sorties', 'calendrier', 'vol', 'activite', 'programme', 'event', 'evenement', 'outing'];
   
+  // 1. Recherche parmi tous les salons des serveurs où est le bot
+  for (const [_, guild] of client.guilds.cache) {
+    try {
+      const channels = await guild.channels.fetch().catch(() => guild.channels.cache);
+      for (const [_, channel] of channels) {
+        if (channel && channel.isTextBased()) {
+          const n = channel.name.toLowerCase();
+          if (keywords.some(k => n.includes(k))) return channel;
+        }
+      }
+    } catch (e) {
+      for (const [_, channel] of guild.channels.cache) {
+        if (channel && channel.isTextBased()) {
+          const n = channel.name.toLowerCase();
+          if (keywords.some(k => n.includes(k))) return channel;
+        }
+      }
+    }
+  }
+
+  // 2. Repli salon discussion générale
   for (const [_, guild] of client.guilds.cache) {
     for (const [_, channel] of guild.channels.cache) {
-      if (channel.isTextBased()) {
+      if (channel && channel.isTextBased()) {
         const n = channel.name.toLowerCase();
-        if (keywords.some(k => n.includes(k))) return channel;
+        if (n.includes('general') || n.includes('discussion') || n.includes('accueil') || n.includes('blabla')) {
+          return channel;
+        }
       }
     }
   }
+
+  // 3. Dernier recours : n'importe quel salon textuel
   for (const [_, guild] of client.guilds.cache) {
     for (const [_, channel] of guild.channels.cache) {
-      if (channel.isTextBased() && (channel.name.includes('general') || channel.name.includes('discussion') || channel.name.includes('accueil'))) {
-        return channel;
-      }
-    }
-  }
-  for (const [_, guild] of client.guilds.cache) {
-    for (const [_, channel] of guild.channels.cache) {
-      if (channel.isTextBased()) return channel;
+      if (channel && channel.isTextBased()) return channel;
     }
   }
   return null;
@@ -594,7 +614,7 @@ http.createServer(async (req, res) => {
 
       // Si pas encore sur Discord ou introuvable, poster dans le bon salon
       if (!msg) {
-        channel = findTargetChannel('covoit', ride.discordChannelId);
+        channel = await findTargetChannel('covoit', ride.discordChannelId);
         if (!channel) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ ok: false, error: 'Aucun salon accessible pour poster la navette' }));
@@ -674,7 +694,7 @@ http.createServer(async (req, res) => {
 
       // Si pas encore sur Discord ou introuvable, poster dans le bon salon
       if (!msg) {
-        channel = findTargetChannel('sortie', outing.discordChannelId);
+        channel = await findTargetChannel('sortie', outing.discordChannelId);
         if (!channel) {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           return res.end(JSON.stringify({ ok: false, error: 'Aucun salon accessible pour poster la sortie' }));
